@@ -1511,13 +1511,42 @@ static int check_native_source_arithmetic(void) {
     fprintf(stderr, "native FP8/FP4 block accumulation and HC source order: PASS\n");
     return 1;
 }
+/* A real key at position 248 crosses a BF16 midpoint if the rotation's
+ * two products are contracted in the opposite order. */
+static int check_native_key_rotation(void) {
+    const float rotary[] = {
+        .1484375f, .9609375f, .314453125f, .953125f, 1.3515625f, -.44140625f,
+        -.216796875f, .72265625f, -1.0703125f, -.2021484375f, .134765625f, .392578125f,
+        -.83203125f, .7890625f, .296875f, 1.234375f, -.64453125f, -.1015625f,
+        .83984375f, -.95703125f, -1.078125f, -2.21875f, .263671875f, -.85546875f,
+        .177734375f, .1953125f, -1.3828125f, -.1953125f, -.455078125f, -.2392578125f,
+        .09619140625f, .466796875f,
+    };
+    const float expected[] = {
+        -.3125f, -.9375f, -.5625f, .875f, -1.125f, -.9375f, .5f, .5625f,
+        -.6875f, .875f, -.04296875f, .40625f, -1.125f, -.375f, 1.125f, .625f,
+        -.625f, .00634765625f, .21875f, 1.25f, -1.875f, -1.625f, -.8125f, .34375f,
+        -.234375f, -.1171875f, .625f, -1.25f, .1171875f, -.5f, -.3125f, .375f,
+    };
+    float input[512] = {0}, actual[512];
+    memcpy(input + 448, rotary, sizeof(rotary));
+    ds4_gpu_tensor *x = upload(input, sizeof(input));
+    ds4_gpu_tensor *out = upload(NULL, sizeof(actual));
+    CHECK(x && out && ds4_gpu_dsv41_native_rope_quantize(x, out, 0,
+        512, 248, true, DS4_V41_FP8_E8M0));
+    CHECK(ds4_gpu_synchronize() && ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)));
+    for (unsigned i = 0; i < 32; i++) CHECK(actual[448 + i] == expected[i]);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out);
+    fprintf(stderr, "native key rotation midpoint: PASS\n");
+    return 1;
+}
 #endif
 
 int main(int argc, char **argv) {
 #ifdef __APPLE__
     if (argc == 2 && !strcmp(argv[1], "--native-source")) {
         const int ok = ds4_gpu_dsv41_require_native_math() && ds4_gpu_init() &&
-            check_quantization(true) && check_native_source_arithmetic();
+            check_quantization(true) && check_native_key_rotation() && check_native_source_arithmetic();
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }

@@ -41574,6 +41574,20 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
 }
 
+static bool ds41_rope_store(ds4_gpu_tensor *x, ds4_gpu_tensor *cache, uint64_t offset,
+                            uint32_t width, uint32_t il, uint32_t pos,
+                            ds4_v41_activation_format format, bool native) {
+#ifdef __APPLE__
+    if (native) return ds4_gpu_dsv41_native_rope_quantize(x, cache, offset, width, pos,
+        ds4_layer_compress_ratio(il) != 0, format);
+#else
+    (void)native;
+#endif
+    return ds41_rope(x, 1, width, il, pos, false) &&
+        ds4_gpu_dsv41_quantize(x, width, 1, format) &&
+        ds4_gpu_tensor_copy(cache, offset, x, 0, (uint64_t)width * sizeof(float));
+}
+
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41595,14 +41609,12 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
             if (!ds41_norm(g->latent, g->latent, m, l->attn_compressor_norm) ||
                 !ds41_matmul(g->index_k, m, l->indexer_attn_k, g->latent, true) ||
                 !ds41_norm(g->index_k, g->index_k, m, l->indexer_k_norm) ||
-                !ds41_rope(g->index_k, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) ||
-                !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
-                !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
-                                     g->index_k, 0, 128u * 4u) ||
-                !ds41_rope(g->latent, 1, 512, il, rope_pos, false) ||
-                !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
-                !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
-                                     g->latent, 0, 512u * 4u)) return false;
+                !ds41_rope_store(g->index_k, g->index_cache[owner],
+                    (uint64_t)(n_comp - 1u) * 128u * 4u, DS4_N_INDEXER_HEAD_DIM,
+                    il, rope_pos, DS4_V41_FP4_E8M0, m->native_weights) ||
+                !ds41_rope_store(g->latent, g->compressed[owner],
+                    (uint64_t)(n_comp - 1u) * 512u * 4u, 512, il, rope_pos,
+                    DS4_V41_FP4_E4M3, m->native_weights)) return false;
         }
     }
     return true;
@@ -41681,10 +41693,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t head0 = g->tp_rank * heads;
     if (!projected && !ds41_attention_project(g, m, l)) return false;
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
-        !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
-        !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
-                             g->kv, 0, 512u * 4u) ||
+        !ds41_rope_store(g->kv, g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
+            DS4_N_HEAD_DIM, il, pos, DS4_V41_FP8_E8M0, m->native_weights) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
 #ifdef __APPLE__

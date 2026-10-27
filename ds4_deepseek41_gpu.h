@@ -49,6 +49,10 @@ int ds4_gpu_dsv41_native_hc(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 int ds4_gpu_dsv41_native_hc_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
     const void *model_map, uint64_t model_size, uint64_t fn_offset,
     uint32_t width, uint32_t rows, float eps, uint32_t tokens);
+/* Rotate and quantize one native key directly into its cache row. */
+int ds4_gpu_dsv41_native_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst,
+    uint64_t dst_offset, uint32_t width, uint32_t start, bool compressed,
+    ds4_v41_activation_format format);
 int ds4_gpu_dsv41_native_router(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
     ds4_gpu_tensor *probs, const ds4_gpu_tensor *logits, const void *model_map,
     uint64_t model_size, uint64_t bias_offset, uint32_t experts, uint32_t top, float scale);

@@ -151,6 +151,48 @@ typedef decltype(kernel_dsv41_quantize_impl<false>) dsv41_quantize_kernel;
 template [[host_name("kernel_dsv41_quantize")]] kernel dsv41_quantize_kernel kernel_dsv41_quantize_impl<false>;
 template [[host_name("kernel_dsv41_native_quantize")]] kernel dsv41_quantize_kernel kernel_dsv41_quantize_impl<true>;
 
+struct ds4_metal_args_dsv41_native_rope_quantize {
+    uint width, start, inverse, mode;
+    float frequencies[32];
+};
+
+// Preserve the native cache rotation's contraction order explicitly. A
+// different FMA can cross a BF16 midpoint before FP8/FP4 quantization.
+kernel void kernel_dsv41_native_rope_quantize(
+        constant ds4_metal_args_dsv41_native_rope_quantize &args,
+        device const float *x,
+        device float *dst,
+        uint group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint block = args.mode == 3u ? 16u : 32u;
+    const uint column = group * block + lane;
+    const bool valid = lane < block && column < args.width;
+    float value = valid ? x[column] : 0.0f;
+    const float other = simd_shuffle_xor(value, 1u);
+    const uint rotary = args.width - 64u;
+    if (valid && column >= rotary) {
+        const float theta = float(args.start) * args.frequencies[(column - rotary) >> 1u];
+        const float c = precise::cos(theta);
+        const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+        const float re = (column & 1u) ? other : value;
+        const float im = (column & 1u) ? value : other;
+        value = (column & 1u) ? dsv41_bf16(fma(im, c, re * s)) : dsv41_bf16(fma(re, c, -(im * s)));
+    }
+    value = dsv41_bf16(value);
+    const float amax = simd_max(abs(value));
+    float result = value;
+    if (args.mode == 1u) {
+        const float scale = dsv41_pow2_ceil(max(amax, 1.0e-4f) * (1.0f / 448.0f));
+        result = copysign(dsv4_e4m3fn_dequant(abs(value) / scale), value) * scale;
+    } else if (args.mode == 2u || args.mode == 3u) {
+        const float scale = args.mode == 3u
+            ? dsv41_fp4_e4m3_scale(amax)
+            : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
+        result = dsv41_fp4_scaled(value, scale);
+    }
+    if (valid) dst[column] = dsv41_bf16(result);
+}
+
 struct ds4_metal_args_dsv41_engram {
     uint width;
     uint rows;

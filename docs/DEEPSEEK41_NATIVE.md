@@ -91,7 +91,7 @@ native router computes scores and searches for experts in parallel, keeping the
 lowest expert ID for ties and the original serial normalization order.
 
 With a checked BF16 layer, native prefill batches Engram and HC inputs, query/key
-projections, paired normalization, and the final attention projection. Engram and
+projections, normalization, and the final attention projection. Engram and
 HC finish before Q reuses their storage; keys are still published and attended
 in causal token order with the original per-row arithmetic. After the tile's
 attention finishes, FFN work is batched. Independent HC projections and shared-expert
@@ -127,7 +127,11 @@ sublayer output. Native HC expansion and weighted sums also preserve the release
 source's separate FP32 product and addition boundaries: Metal safe math alone
 still permits contraction, so these expressions explicitly disable it. Focused
 cancellation cases exercise scale blocks, sum order and product rounding through
-the native APIs and the independent CPU translation:
+the native APIs and the independent CPU translation.
+
+Native key rotation also fixes the FMA order before its BF16 and FP8/FP4
+rounding. This keeps cache values stable when moving between fused and separate
+rotation passes; a production-width midpoint case is included in the Metal checks.
 
 ```sh
 make tests/test_deepseek41_metal

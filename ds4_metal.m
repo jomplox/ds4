@@ -47824,14 +47824,7 @@ static bool dsv41_tensor_has_floats(const ds4_gpu_tensor *tensor, uint64_t count
 /* Frequency rounding errors accumulate into phase errors at long contexts.
  * Preserve the reference's pow/reciprocal and YaRN operation order here. */
 #pragma float_control(precise, on, push)
-int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
-                             uint32_t rows, uint32_t start, uint32_t stride,
-                             bool compressed, bool inverse) {
-    if (width < 64 || !heads || !rows || rows > 1048576 || !stride ||
-        (uint64_t)start + (uint64_t)(rows - 1u) * stride >= 1048576u ||
-        (uint64_t)heads * rows > UINT64_MAX / width ||
-        !dsv41_tensor_has_floats(x, (uint64_t)width * heads * rows)) return 0;
-    if (!g_initialized && !ds4_gpu_init()) return 0;
+static const float *ds4_gpu_dsv41_rope_frequencies(bool compressed) {
     static float frequencies[2][32];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -47853,6 +47846,17 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
             }
         }
     });
+    return frequencies[compressed ? 1 : 0];
+}
+
+int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                             uint32_t rows, uint32_t start, uint32_t stride,
+                             bool compressed, bool inverse) {
+    if (width < 64 || !heads || !rows || rows > 1048576 || !stride ||
+        (uint64_t)start + (uint64_t)(rows - 1u) * stride >= 1048576u ||
+        (uint64_t)heads * rows > UINT64_MAX / width ||
+        !dsv41_tensor_has_floats(x, (uint64_t)width * heads * rows)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_rope");
         if (!pipeline) return 0;
@@ -47860,7 +47864,7 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
             uint32_t width, heads, rows, start, inverse, stride;
             float frequencies[32];
         } args = {width, heads, rows, start, inverse, stride, {0}};
-        memcpy(args.frequencies, frequencies[compressed ? 1 : 0], sizeof(args.frequencies));
+        memcpy(args.frequencies, ds4_gpu_dsv41_rope_frequencies(compressed), sizeof(args.frequencies));
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
@@ -47879,6 +47883,38 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse) {
     return ds4_gpu_dsv41_rope_stride(x, width, heads, rows, start, 1, compressed, inverse);
+}
+
+int ds4_gpu_dsv41_native_rope_quantize(const ds4_gpu_tensor *x, ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                uint32_t width, uint32_t start, bool compressed,
+                                ds4_v41_activation_format format) {
+    const uint32_t block = format == DS4_V41_FP4_E4M3 ? 16u : 32u;
+    if (!g_dsv41_native_math || width < 64u || width % block || format < DS4_V41_FP8_E8M0 || format > DS4_V41_FP4_E4M3 ||
+        start >= 1048576u || dst_offset % 4u || !dsv41_tensor_has_floats(x, width) ||
+        !dst || dst_offset > ds4_gpu_tensor_bytes(dst) ||
+        (uint64_t)width * sizeof(float) > ds4_gpu_tensor_bytes(dst) - dst_offset) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_native_rope_quantize");
+        if (!pipeline) return 0;
+        struct {
+            uint32_t width, start, inverse, mode;
+            float frequencies[32];
+        } args = {width, start, 0u, (uint32_t)format, {0}};
+        memcpy(args.frequencies, ds4_gpu_dsv41_rope_frequencies(compressed), sizeof(args.frequencies));
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x) offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(dst) offset:ds4_gpu_tensor_offset(dst) + (NSUInteger)dst_offset atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(width / block, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 rope, quantization and store");
+    }
 }
 
 /* A few rows through the single-row F32 matvec kernel (one grid row each), so
